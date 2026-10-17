@@ -75,7 +75,12 @@ async def rate_limit_middleware(request: Request, call_next):
             return JSONResponse(
                 status_code=exc.status_code,
                 content={"detail": exc.detail},
-                headers=exc.headers,
+                headers={
+                    **exc.headers,
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "*",
+                    "Access-Control-Allow-Headers": "*",
+                },
             )
 
     return await call_next(request)
