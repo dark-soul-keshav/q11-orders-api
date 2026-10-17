@@ -4,12 +4,38 @@ import uuid
 import threading
 from collections import defaultdict, deque
 from typing import Optional
-from fastapi.responses import JSONResponse
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+
+# --------------------------------------------------
+# Application configuration
+# --------------------------------------------------
+
 app = FastAPI(title="Q11 Orders API")
+
+TOTAL_ORDERS = 54
+RATE_LIMIT = 17
+WINDOW_SECONDS = 10
+
+# Fixed catalog with IDs 1 through 54.
+catalog = [
+    {"id": i, "item": f"Item {i}", "quantity": 1}
+    for i in range(1, TOTAL_ORDERS + 1)
+]
+
+# In-memory storage.
+idempotency_keys = {}
+client_requests = defaultdict(deque)
+lock = threading.Lock()
+
+
+# --------------------------------------------------
+# CORS
+# --------------------------------------------------
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,87 +43,93 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Retry-After"],
 )
 
-TOTAL_ORDERS = 54
-RATE_LIMIT = 17
-WINDOW_SECONDS = 10
 
-# Fixed catalog: IDs 1 through 54.
-catalog = [
-    {"id": i, "item": f"Item {i}", "quantity": 1}
-    for i in range(1, TOTAL_ORDERS + 1)
-]
-
-# In-memory state.
-idempotency_keys = {}
-created_orders = []
-client_requests = defaultdict(deque)
-lock = threading.Lock()
-
+# --------------------------------------------------
+# Request models
+# --------------------------------------------------
 
 class OrderRequest(BaseModel):
     item: str = "Sample item"
     quantity: int = Field(default=1, ge=1)
 
 
-def check_rate_limit(client_id: str):
+# --------------------------------------------------
+# Rate limiting
+# --------------------------------------------------
+
+def get_retry_after(client_id: str) -> Optional[int]:
+    """
+    Allow 17 requests per client in a rolling 10-second window.
+    Return None if allowed; otherwise return Retry-After seconds.
+    """
     now = time.monotonic()
 
     with lock:
         requests = client_requests[client_id]
 
+        # Remove timestamps outside the rolling window.
         while requests and now - requests[0] >= WINDOW_SECONDS:
             requests.popleft()
 
         if len(requests) >= RATE_LIMIT:
-            retry_after = max(
-                1, int(WINDOW_SECONDS - (now - requests[0]) + 0.999)
-            )
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded",
-                headers={"Retry-After": str(retry_after)},
-            )
+            wait_seconds = WINDOW_SECONDS - (now - requests[0])
+            return max(1, int(wait_seconds + 0.999))
 
         requests.append(now)
+        return None
 
 
 @app.middleware("http")
-async def rate_limit_middleware(request: Request, call_next):
-    # Rate-limit API requests using X-Client-Id.
-    if request.url.path in ("/orders",):
+async def rate_limit_middleware(request, call_next):
+    # Apply the limit to both GET and POST /orders.
+    if request.url.path == "/orders" and request.method in ("GET", "POST"):
         client_id = request.headers.get("X-Client-Id", "default-client")
-        try:
-            check_rate_limit(client_id)
-        except HTTPException as exc:
-            return JSONResponse(
+
+        retry_after = get_retry_after(client_id)
+
+        if retry_after is not None:
+            response = JSONResponse(
                 status_code=429,
-                content={"detail": exc.detail},
+                content={"detail": "Rate limit exceeded"},
                 headers={
-                    **exc.headers,
-                    "Retry-After": str(
-                        exc.headers.get("Retry-After", "10")
-                    ),
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "*",
-                    "Access-Control-Allow-Headers": "*",
+                    "Retry-After": str(retry_after),
                 },
             )
+            return response
 
     return await call_next(request)
 
 
+# --------------------------------------------------
+# Root and health endpoints
+# --------------------------------------------------
+
 @app.get("/")
 def root():
-    return {"service": "Q11 Orders API", "total_orders": TOTAL_ORDERS}
+    return {
+        "service": "Q11 Orders API",
+        "total_orders": TOTAL_ORDERS,
+    }
 
+
+@app.get("/healthz")
+def health():
+    return {"status": "ok"}
+
+
+# --------------------------------------------------
+# Create orders with idempotency
+# --------------------------------------------------
 
 @app.post("/orders", status_code=201)
 def create_order(
     order: OrderRequest,
     idempotency_key: Optional[str] = Header(
-        default=None, alias="Idempotency-Key"
+        default=None,
+        alias="Idempotency-Key",
     ),
 ):
     if not idempotency_key:
@@ -107,6 +139,7 @@ def create_order(
         )
 
     with lock:
+        # Return the original order for a repeated key.
         if idempotency_key in idempotency_keys:
             return idempotency_keys[idempotency_key]
 
@@ -117,24 +150,39 @@ def create_order(
         }
 
         idempotency_keys[idempotency_key] = new_order
-        created_orders.append(new_order)
 
         return new_order
 
+
+# --------------------------------------------------
+# Cursor-based pagination
+# --------------------------------------------------
 
 @app.get("/orders")
 def list_orders(
     limit: int = Query(default=10, ge=1, le=100),
     cursor: Optional[str] = None,
 ):
-    # Cursor is the next catalog index, encoded as an opaque string.
-    try:
-        start = int(cursor) if cursor is not None else 0
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+    # The cursor is the index of the next catalog item.
+    if cursor is None or cursor == "":
+        start = 0
+    else:
+        try:
+            start = int(cursor)
+        except (ValueError, TypeError):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid cursor",
+            )
 
-    if start < 0 or start > TOTAL_ORDERS:
-        raise HTTPException(status_code=400, detail="Invalid cursor")
+    if start < 0 or start >= TOTAL_ORDERS:
+        if start == TOTAL_ORDERS:
+            return {"items": [], "next_cursor": None}
+
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid cursor",
+        )
 
     end = min(start + limit, TOTAL_ORDERS)
     items = catalog[start:end]
@@ -145,8 +193,3 @@ def list_orders(
         "items": items,
         "next_cursor": next_cursor,
     }
-
-
-@app.get("/healthz")
-def health():
-    return {"status": "ok"}
