@@ -71,12 +71,14 @@ async def rate_limit_middleware(request: Request, call_next):
         try:
             check_rate_limit(client_id)
         except HTTPException as exc:
-            from fastapi.responses import JSONResponse
             return JSONResponse(
-                status_code=exc.status_code,
+                status_code=429,
                 content={"detail": exc.detail},
                 headers={
                     **exc.headers,
+                    "Retry-After": str(
+                        exc.headers.get("Retry-After", "10")
+                    ),
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Methods": "*",
                     "Access-Control-Allow-Headers": "*",
